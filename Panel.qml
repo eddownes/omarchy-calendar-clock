@@ -315,7 +315,8 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.editingLife
+      // While a settings input holds focus, text keys belong to it.
+      blocked: root.editingLife || feedUrl.activeFocus
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) root.moveMonth(dx)
         if (dy !== 0) root.moveYear(dy)
@@ -330,6 +331,8 @@ Panel {
         else if (t === "}") root.moveYear(1)
         else if (t === "t" || t === "T") root.goToToday()
         else if (t === "w" || t === "W") root.toggleWeekStart()
+        else if (t === "s" || t === "S") root.settingsOpen = !root.settingsOpen
+        else if (t === "u" || t === "U") root.showUpcoming = !root.showUpcoming
       }
 
       Flickable {
