@@ -1,8 +1,13 @@
-# My Clock for Omarchy
+# Calendar Clock for Omarchy
 
 The Omarchy bar clock, upgraded: date and time on the bar, and a popup with
 a month calendar, year/life progress bars, and your upcoming events from
 any iCalendar (.ics) feed.
+
+This exists because I liked the design of Omarchy's default clock and its
+calendar popup — the hero date, the quiet month grid, the progress rails —
+and wanted that exact look to also show my real events. So this is the
+stock design, kept as-is, wired to live calendars.
 
 ![Preview](preview.png)
 
@@ -33,7 +38,7 @@ sudo pacman -S --needed python-icalendar python-recurring-ical-events
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/matteodevenuto/omarchy-myclock --enable
+omarchy plugin add https://github.com/matteodevenuto/omarchy-calendar-clock --enable
 ```
 
 It replaces the stock clock widget in place. Click the clock to open the

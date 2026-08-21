@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "matteodevenuto.clock",
-  "name": "My Clock",
+  "name": "Calendar Clock",
   "version": "1.0.0",
   "author": "Omarchy",
   "description": "Date/time label with a calendar popup",
@@ -12,7 +12,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "My Clock",
+    "displayName": "Calendar Clock",
     "description": "Date/time label with a calendar popup and iCalendar feed events",
     "category": "Time",
     "allowMultiple": false,
