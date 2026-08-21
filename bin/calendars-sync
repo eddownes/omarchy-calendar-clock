@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import ipaddress
+import json
+import multiprocessing
+import os
+import re
+import resource
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from datetime import date, datetime, timedelta
+
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy/calendars")
+CACHE_DIR = os.path.expanduser("~/.cache/omarchy/calendars")
+DEFAULT_FEEDS = os.path.join(CONFIG_DIR, "feeds.json")
+LEGACY_CONFIG_DIR = os.path.expanduser("~/.config/omarchy/protoncalendar")
+
+PALETTE = [
+    "#8b7ff5",
+    "#3fb98f",
+    "#e8a33d",
+    "#e0688a",
+    "#4fa8de",
+    "#c07ee8",
+]
+
+FETCH_TIMEOUT = 20
+MAX_FEED_BYTES = 32 * 1024 * 1024
+EXPANSION_CPU_LIMIT_SEC = 6
+EXPANSION_MEMORY_LIMIT_BYTES = 300 * 1024 * 1024
+MAX_EVENTS_PER_FEED = 3000
+MAX_EVENTS_TOTAL = 10000
+MAX_FEEDS = 50
+
+
+class ExpansionAborted(Exception):
+    pass
+
+
+def parse_calendar_lenient(text, force_split=False):
+    """Parse a calendar, tolerating individual broken VEVENTs.
+
+    Some providers export events that icalendar cannot parse (icalendar
+    7.x crashes with AttributeError on certain parameter values, e.g. in
+    Google-imported events re-exported by Proton), and others parse fine
+    as a whole but carry stamps icalendar stores as "broken properties"
+    that only blow up during recurrence expansion. Either way a single
+    such event would sink the whole feed. Split into per-VEVENT
+    mini-calendars and keep the ones that survive; returns
+    (calendars, skipped)."""
+    import icalendar
+
+    if not force_split:
+        try:
+            return [icalendar.Calendar.from_ical(text)], 0
+        except Exception:
+            pass
+
+    blocks = []
+    block = None
+    for line in text.splitlines():
+        marker = line.strip().upper()
+        if marker == "BEGIN:VEVENT":
+            block = [line]
+        elif block is not None:
+            block.append(line)
+            if marker == "END:VEVENT":
+                blocks.append(block)
+                block = None
+
+    wrapper = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//lenient//EN"]
+    good = []
+    for candidate in blocks:
+        try:
+            good.append(icalendar.Calendar.from_ical(
+                "\r\n".join(wrapper + candidate + ["END:VCALENDAR"]) + "\r\n"))
+        except Exception:
+            continue
+    if not good:
+        # nothing survived; re-raise the original whole-file error
+        icalendar.Calendar.from_ical(text)
+    return good, len(blocks) - len(good)
+
+
+def _calendar_name(feed, calendars, raw_text):
+    name = plain_text(feed["name"])
+    if name:
+        return name
+    for calendar in calendars:
+        found = text_of(calendar, "X-WR-CALNAME")
+        if found:
+            return found
+    match = re.search(r"^X-WR-CALNAME[;:](.*)$", raw_text, re.MULTILINE | re.IGNORECASE)
+    if match:
+        found = plain_text(match.group(1).strip().replace("\\,", ",").replace("\\;", ";"))
+        if found:
+            return found
+    return "Calendar"
+
+
+def _expand_worker(text, feed, window_start, window_end, tz, out_queue):
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (EXPANSION_CPU_LIMIT_SEC, EXPANSION_CPU_LIMIT_SEC))
+        resource.setrlimit(resource.RLIMIT_AS, (EXPANSION_MEMORY_LIMIT_BYTES, EXPANSION_MEMORY_LIMIT_BYTES))
+    except (ValueError, OSError):
+        pass
+
+    try:
+        import icalendar
+        import recurring_ical_events
+
+        def expand_all(calendars):
+            occurrences = []
+            for calendar in calendars:
+                occurrences.extend(
+                    recurring_ical_events.of(calendar).between(window_start, window_end))
+            return occurrences
+
+        # Fast path: parse and expand the feed as one calendar.
+        skipped = 0
+        try:
+            whole = icalendar.Calendar.from_ical(text)
+            occurrences = expand_all([whole])
+            calendars = [whole]
+            name = _calendar_name(feed, calendars, text)
+        except Exception:
+            # Some providers export individual events icalendar cannot
+            # handle (e.g. Google-imported events re-exported by Proton
+            # against icalendar 7.x). Parse each VEVENT in isolation and
+            # keep what survives, so one broken event does not sink the
+            # whole feed.
+            fallback_error = None
+            try:
+                calendars, skipped = parse_calendar_lenient(text, force_split=True)
+            except Exception as exc:
+                fallback_error = exc
+            if fallback_error or not calendars:
+                raise fallback_error or RuntimeError("no readable events")
+            name = _calendar_name(feed, calendars, text)
+            occurrences = []
+            for calendar in calendars:
+                try:
+                    occurrences.extend(
+                        recurring_ical_events.of(calendar).between(window_start, window_end))
+                except Exception:
+                    skipped += 1
+            if not occurrences:
+                raise RuntimeError(
+                    f"all events unreadable ({skipped} skipped)") from fallback_error
+
+        truncated = len(occurrences) > MAX_EVENTS_PER_FEED
+        occurrences = occurrences[:MAX_EVENTS_PER_FEED]
+
+        events = []
+        for component in occurrences:
+            try:
+                start = component.get("DTSTART")
+                if start is None:
+                    continue
+                start = start.dt
+                end = component.get("DTEND")
+                end = end.dt if end is not None else None
+            except Exception:
+                # icalendar keeps some malformed stamps as "broken
+                # properties"; one unreadable event must not sink the feed.
+                skipped += 1
+                continue
+
+            all_day = is_all_day(start)
+            if end is None:
+                end = start
+
+            start = to_local(start, tz)
+            end = to_local(end, tz)
+            if end < start:
+                end = start
+
+            events.append({
+                "uid": text_of(component, "UID"),
+                "title": text_of(component, "SUMMARY") or "(no title)",
+                "start": iso(start),
+                "end": iso(end),
+                "allDay": all_day,
+                "location": text_of(component, "LOCATION"),
+                "description": text_of(component, "DESCRIPTION"),
+                "status": text_of(component, "STATUS"),
+                "calendar": name,
+                "color": feed["color"],
+            })
+        out_queue.put(("ok", events, name, truncated, skipped))
+    except MemoryError:
+        out_queue.put(("error", "memory limit exceeded (possible hostile recurrence rule)"))
+    except Exception as exc:
+        out_queue.put(("error", f"parse failed: {exc}"))
+
+
+def expand_isolated(text, feed, window_start, window_end, tz):
+    # recurring_ical_events materializes the full occurrence list before
+    # returning, so a high-frequency RRULE (FREQ=SECONDLY with no COUNT or
+    # UNTIL) can already exhaust memory before any cap on the *result* would
+    # help. Doing the expansion in a child process with hard CPU and address
+    # space rlimits bounds both, enforced by the kernel rather than by
+    # anything this script could fail to catch.
+    ctx = multiprocessing.get_context("fork")
+    out_queue = ctx.Queue()
+    worker = ctx.Process(
+        target=_expand_worker, args=(text, feed, window_start, window_end, tz, out_queue)
+    )
+    worker.start()
+
+    # Read from the queue *before* joining, not after. The result is pickled
+    # and sent through an OS pipe with a fixed (typically 64KB) buffer; a feed
+    # with a few hundred occurrences easily produces a payload several times
+    # that size. If we join() first, the child's queue-feeder thread blocks
+    # writing to a pipe nobody is draining, the child can never exit, and
+    # join() waits for an exit that will never come -- a guaranteed deadlock
+    # that has nothing to do with how long the expansion actually took.
+    try:
+        status, *rest = out_queue.get(timeout=EXPANSION_CPU_LIMIT_SEC + 4)
+    except Exception:
+        still_running = worker.is_alive()
+        if still_running:
+            worker.kill()
+        worker.join(1)
+        if still_running:
+            raise ExpansionAborted(f"recurrence expansion exceeded {EXPANSION_CPU_LIMIT_SEC}s")
+        detail = f"exit code {worker.exitcode}" if worker.exitcode else "no result"
+        raise ExpansionAborted(
+            f"recurrence expansion aborted ({detail}, possible hostile recurrence rule)"
+        )
+
+    worker.join(1)
+    if worker.is_alive():
+        worker.kill()
+        worker.join()
+
+    if status == "error":
+        raise ExpansionAborted(rest[0])
+    return rest[0], rest[1], rest[2], rest[3]
+
+
+def feeds_path(override):
+    return os.path.expanduser(override) if override else DEFAULT_FEEDS
+
+
+def migrate_legacy_feeds(override):
+    # One-time carry-over from the plugin this one is based on (see README):
+    # if this install has no feeds yet but the original protoncalendar
+    # plugin's directory does, copy them across so nobody has to re-paste
+    # secret share links. Copied, not moved -- the original plugin keeps
+    # working off its own file.
+    path = feeds_path(override)
+    if override or path != DEFAULT_FEEDS or os.path.exists(path):
+        return
+    legacy = os.path.join(LEGACY_CONFIG_DIR, "feeds.json")
+    if not os.path.exists(legacy):
+        return
+    try:
+        ensure_private_dir(CONFIG_DIR)
+        shutil.copy2(legacy, path)
+    except OSError:
+        pass
+
+
+def load_feeds(path):
+    if not os.path.exists(path):
+        return [], ""
+    try:
+        os.chmod(os.path.dirname(path) or ".", 0o700)
+    except OSError:
+        pass
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return [], f"{path}: {exc}"
+
+    if isinstance(raw, dict):
+        raw = raw.get("feeds", [])
+    if not isinstance(raw, list):
+        return [], f"{path}: expected a list of feeds"
+
+    feeds = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url", "")).strip()
+        if not url:
+            continue
+        feeds.append({
+            "name": str(entry.get("name", "")).strip(),
+            "url": url,
+            "color": str(entry.get("color", "")).strip() or PALETTE[index % len(PALETTE)],
+            "enabled": entry.get("enabled", True) is not False,
+        })
+    return feeds, ""
+
+
+def save_feeds(path, feeds):
+    ensure_private_dir(os.path.dirname(path))
+    payload = [
+        {"name": f["name"], "url": f["url"], "color": f["color"], "enabled": f["enabled"]}
+        for f in feeds
+    ]
+    write_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def ensure_private_dir(directory):
+    # feeds.json and the cached .ics files hold share-link URLs, which are
+    # bearer-style secrets -- keep the directory owner-only rather than
+    # relying only on the files inside it being 0600.
+    os.makedirs(directory, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+
+def write_atomic(path, text):
+    directory = os.path.dirname(path) or "."
+    ensure_private_dir(directory)
+    handle, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def cache_file(url):
+    return os.path.join(CACHE_DIR, hashlib.sha256(url.encode()).hexdigest()[:16] + ".ics")
+
+
+def resolve_public_ip(hostname, port):
+    try:
+        infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        return None, f"DNS resolution failed: {exc}"
+
+    # is_global is the inverse of every non-routable range the stdlib knows
+    # about -- RFC1918, loopback, link-local, CGNAT (100.64.0.0/10),
+    # documentation/test ranges, etc. -- rather than a hand-picked list this
+    # script would have to keep in sync with every SSRF target class itself.
+    allow_private = os.environ.get("CALENDARS_ALLOW_PRIVATE_HOSTS") == "1"
+    for family, _, _, _, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not allow_private and not ip.is_global:
+            continue
+        return sockaddr[0], None
+    return None, "resolves only to a private/internal address"
+
+
+def curl_config(url):
+    # The URL is a bearer-style secret (anyone holding it can read the
+    # calendar), and process arguments are world-readable via /proc/<pid>/
+    # cmdline on a typical Linux system. Handing it to curl through a
+    # config file piped over stdin (-K -) keeps it out of argv/ps entirely.
+    escaped = url.replace("\\", "\\\\").replace('"', '\\"')
+    return f'url = "{escaped}"\n'
+
+
+MAX_REDIRECTS = 5
+STATUS_LINE_RE = re.compile(r"^HTTP/\S+\s+(\d\d\d)", re.MULTILINE)
+LOCATION_RE = re.compile(r"^Location:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
+
+
+def fetch_one_hop(url):
+    """One request, redirects NOT followed by curl -- the caller revalidates
+    and re-pins each hop itself, so a public feed can't redirect to a
+    loopback/private address once the initial host has passed the check.
+
+    A malformed URL -- including one a redirect's Location header hands us,
+    which is remote-controlled -- must fail this one hop, not raise: urlsplit
+    and its .hostname/.port properties throw ValueError on things like an
+    unterminated IPv6 bracket, and an uncaught exception here would abort
+    sync() for every other feed too, not just this one."""
+    if any(c in url for c in "\r\n\x00"):
+        # curl_config() hands the URL to curl as a config-file line. A CR or
+        # LF inside it would start a *second* config directive -- e.g. a
+        # trailing `\nurl = "http://169.254.169.254/..."` -- that curl would
+        # honor instead of (or as well as) the one just validated below.
+        return None, None, "malformed URL: contains a control character"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        return None, None, f"malformed URL: {exc}"
+
+    if scheme not in ("http", "https"):
+        return None, None, f"unsupported URL scheme: {scheme or '(none)'}"
+    if not hostname:
+        return None, None, "URL has no host"
+
+    port = port or (443 if scheme == "https" else 80)
+    ip, dns_error = resolve_public_ip(hostname, port)
+    if dns_error:
+        return None, None, dns_error
+
+    handle, header_path = tempfile.mkstemp(prefix=".hdr-")
+    os.close(handle)
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-K", "-", "--proto", "=http,https",
+             "--resolve", f"{hostname}:{port}:{ip}",
+             "--max-time", str(FETCH_TIMEOUT),
+             "--max-filesize", str(MAX_FEED_BYTES),
+             "-D", header_path],
+            input=curl_config(url).encode("utf-8"),
+            capture_output=True, timeout=FETCH_TIMEOUT + 10,
+        )
+        with open(header_path, encoding="utf-8", errors="replace") as handle:
+            headers = handle.read()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, None, f"fetch failed: {exc}"
+    finally:
+        try:
+            os.unlink(header_path)
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        return None, None, f"curl exit {result.returncode}{': ' + detail if detail else ''}"
+
+    status_match = STATUS_LINE_RE.findall(headers)
+    status = int(status_match[-1]) if status_match else None
+
+    if status in (301, 302, 303, 307, 308):
+        location_match = LOCATION_RE.findall(headers)
+        if not location_match:
+            return None, None, f"redirect with no Location header (status {status})"
+        try:
+            next_url = urllib.parse.urljoin(url, location_match[-1].strip())
+        except ValueError as exc:
+            return None, None, f"malformed redirect target: {exc}"
+        return None, next_url, None
+
+    if status is None or status >= 400:
+        return None, None, f"HTTP {status}" if status else "no HTTP status in response"
+
+    return result.stdout.decode("utf-8", "replace"), None, None
+
+
+def fetch(url):
+    path = cache_file(url)
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        text, redirect_to, error = fetch_one_hop(current)
+        if error:
+            return read_cache(path, error)
+        if redirect_to:
+            current = redirect_to
+            continue
+
+        if "BEGIN:VCALENDAR" not in text:
+            return read_cache(path, "response is not iCalendar (link wrong, revoked, or expired?)")
+        try:
+            write_atomic(path, text)
+        except OSError:
+            pass
+        return text, "", False
+
+    return read_cache(path, "too many redirects")
+
+
+def read_cache(path, error):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read(), error, True
+    except OSError:
+        return "", error, False
+
+
+def local_tz():
+    name = os.environ.get("TZ", "").strip().lstrip(":")
+    if not name:
+        try:
+            link = os.path.realpath("/etc/localtime")
+            marker = "/zoneinfo/"
+            if marker in link:
+                name = link.split(marker, 1)[1]
+        except OSError:
+            name = ""
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo
+
+
+def is_all_day(value):
+    return isinstance(value, date) and not isinstance(value, datetime)
+
+
+def to_local(value, tz):
+    if is_all_day(value):
+        return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tz)
+    return value.astimezone(tz)
+
+
+def iso(value):
+    if is_all_day(value):
+        return value.isoformat()
+    return value.replace(microsecond=0).isoformat()
+
+
+def plain_text(value):
+    return str(value or "").replace("<", "").replace(">", "")
+
+
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def normalize_color(value):
+    text = str(value or "").strip()
+    return text.lower() if COLOR_RE.match(text) else ""
+
+
+def text_of(component, key):
+    value = component.get(key)
+    if value is None:
+        return ""
+    return plain_text(str(value).strip())
+
+
+def expand(text, feed, window_start, window_end, tz):
+    return expand_isolated(text, feed, window_start, window_end, tz)
+
+
+def dedupe(events):
+    seen = set()
+    unique = []
+    for event in sorted(events, key=lambda e: (e["start"], e["title"])):
+        key = (event["uid"], event["start"], event["calendar"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(event)
+    return unique
+
+
+def sync(path, back_months, forward_months):
+    import icalendar
+    import recurring_ical_events
+
+    feeds, feeds_error = load_feeds(path)
+    if len(feeds) > MAX_FEEDS:
+        feeds = feeds[:MAX_FEEDS]
+        feeds_error = feeds_error or f"only the first {MAX_FEEDS} feeds are synced"
+    tz = local_tz()
+    now = datetime.now(tz)
+
+    window_start = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                    - timedelta(days=31 * back_months))
+    window_end = now + timedelta(days=31 * forward_months)
+
+    report = []
+    events = []
+    for feed in feeds:
+        if not feed["enabled"]:
+            report.append({**feed_summary(feed), "ok": True, "error": "", "skipped": True})
+            continue
+
+        try:
+            text, error, from_cache = fetch(feed["url"])
+        except Exception as exc:
+            # Belt and suspenders alongside the try/except inside fetch_one_hop:
+            # one feed misbehaving -- however it manages to -- must not take
+            # every other feed in this sync down with it.
+            report.append({**feed_summary(feed), "ok": False, "error": plain_text(f"fetch failed: {exc}")})
+            continue
+        if not text:
+            report.append({**feed_summary(feed), "ok": False, "error": error or "no data"})
+            continue
+
+        try:
+            feed_events, resolved, truncated, skipped = expand(text, feed, window_start, window_end, tz)
+        except ExpansionAborted as exc:
+            report.append({**feed_summary(feed), "ok": False, "error": plain_text(str(exc))})
+            continue
+        except Exception as exc:
+            report.append({**feed_summary(feed), "ok": False, "error": plain_text(f"parse failed: {exc}")})
+            continue
+
+        events.extend(feed_events)
+        report.append({
+            **feed_summary(feed),
+            "name": resolved,
+            "ok": not error,
+            "error": error,
+            "stale": from_cache,
+            "count": len(feed_events),
+            "truncated": truncated,
+            "skipped": skipped,
+        })
+
+    if len(events) > MAX_EVENTS_TOTAL:
+        events.sort(key=lambda e: e["start"])
+        events = events[:MAX_EVENTS_TOTAL]
+
+    return {
+        "generatedAt": iso(now),
+        "windowStart": iso(window_start),
+        "windowEnd": iso(window_end),
+        "configured": len(feeds) > 0,
+        "feedsFile": path,
+        "error": feeds_error,
+        "ok": bool(feeds) and all(f.get("ok") for f in report),
+        "feeds": report,
+        "events": dedupe(events),
+    }
+
+
+def feed_summary(feed):
+    return {"name": plain_text(feed["name"]), "url": feed["url"], "color": feed["color"]}
+
+
+def result_path():
+    return os.path.join(CACHE_DIR, "events.json")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fetch shared iCalendar feeds and emit a flat event list as JSON.")
+    parser.add_argument("--feeds", default="", help="feeds file (default ~/.config/omarchy/calendars/feeds.json)")
+    parser.add_argument("--cached", action="store_true", help="print the last result without fetching")
+    parser.add_argument("--add-feed", metavar="URL", help="append a feed and sync")
+    parser.add_argument("--add-feed-env", action="store_true",
+                         help="like --add-feed, but read the URL from $CALENDARS_FEED_URL "
+                              "instead of argv (argv is world-readable via /proc)")
+    parser.add_argument("--name", default="", help="name for --add-feed")
+    parser.add_argument("--remove-feed", metavar="URL", help="drop a feed and sync")
+    parser.add_argument("--remove-feed-env", action="store_true",
+                         help="like --remove-feed, but read the URL from $CALENDARS_FEED_URL")
+    parser.add_argument("--set-feed-color-env", action="store_true",
+                         help="set the color of the feed named by $CALENDARS_FEED_URL "
+                              "to $CALENDARS_FEED_COLOR (#rrggbb), then sync")
+    parser.add_argument("--move-feed-env", action="store_true",
+                         help="move the feed named by $CALENDARS_FEED_URL to 0-based "
+                              "position $CALENDARS_FEED_INDEX, then sync")
+    parser.add_argument("--list-feeds", action="store_true", help="print the configured feeds")
+    parser.add_argument("--back-months", type=int, default=1)
+    parser.add_argument("--forward-months", type=int, default=12)
+    parser.add_argument("--json", action="store_true", help="accepted and ignored; output is always JSON")
+    args = parser.parse_args()
+
+    path = feeds_path(args.feeds)
+    migrate_legacy_feeds(args.feeds)
+
+    if args.list_feeds:
+        feeds, error = load_feeds(path)
+        print(json.dumps({"feedsFile": path, "error": error, "feeds": feeds}, ensure_ascii=False))
+        return 0
+
+    add_url = os.environ.get("CALENDARS_FEED_URL", "") if args.add_feed_env else args.add_feed
+    remove_url = os.environ.get("CALENDARS_FEED_URL", "") if args.remove_feed_env else args.remove_feed
+    color_url = os.environ.get("CALENDARS_FEED_URL", "") if args.set_feed_color_env else ""
+    color_value = normalize_color(os.environ.get("CALENDARS_FEED_COLOR", "")) if color_url else ""
+    move_url = os.environ.get("CALENDARS_FEED_URL", "") if args.move_feed_env else ""
+    move_index = -1
+    if move_url:
+        try:
+            move_index = int(os.environ.get("CALENDARS_FEED_INDEX", ""))
+        except ValueError:
+            move_index = -1
+
+    if add_url or remove_url or (color_url and color_value) or (move_url and move_index >= 0):
+        feeds, error = load_feeds(path)
+        if error:
+            print(json.dumps({"ok": False, "error": error}, ensure_ascii=False))
+            return 0
+        if add_url:
+            url = add_url.strip()
+            if any(f["url"] == url for f in feeds):
+                pass
+            else:
+                feeds.append({
+                    "name": args.name.strip(),
+                    "url": url,
+                    "color": PALETTE[len(feeds) % len(PALETTE)],
+                    "enabled": True,
+                })
+        if remove_url:
+            feeds = [f for f in feeds if f["url"] != remove_url.strip()]
+        if color_url and color_value:
+            for feed in feeds:
+                if feed["url"] == color_url.strip():
+                    feed["color"] = color_value
+        if move_url and move_index >= 0:
+            moving = next((f for f in feeds if f["url"] == move_url.strip()), None)
+            if moving is not None:
+                feeds.remove(moving)
+                feeds.insert(max(0, min(move_index, len(feeds))), moving)
+        try:
+            save_feeds(path, feeds)
+        except OSError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            return 0
+
+    if args.cached:
+        try:
+            with open(result_path(), encoding="utf-8") as handle:
+                sys.stdout.write(handle.read())
+                return 0
+        except OSError:
+            pass
+
+    try:
+        payload = sync(path, max(0, args.back_months), max(1, args.forward_months))
+    except ImportError as exc:
+        payload = {
+            "ok": False, "configured": False, "feeds": [], "events": [],
+            "error": f"missing dependency: {exc}. Install with: "
+                     "sudo pacman -S python-icalendar python-recurring-ical-events",
+        }
+    except Exception as exc:
+        # Every expected failure mode inside sync() is caught per-feed
+        # already; this is only the backstop for whatever isn't -- the
+        # panel should show "sync failed", never lose its last good cache
+        # to a bare traceback and a non-zero exit.
+        payload = {
+            "ok": False, "configured": False, "feeds": [], "events": [],
+            "error": plain_text(f"sync failed: {exc}"),
+        }
+
+    text = json.dumps(payload, ensure_ascii=False)
+    try:
+        write_atomic(result_path(), text)
+    except OSError:
+        pass
+    sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

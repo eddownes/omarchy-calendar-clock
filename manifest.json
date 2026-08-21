@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "matteodevenuto.clock",
+  "name": "My Clock",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Date/time label with a calendar popup",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "My Clock",
+    "description": "Date/time label with a calendar popup and iCalendar feed events",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 900,
+      "feedsFile": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Calendar refresh interval (seconds)",
+        "min": 60,
+        "max": 86400,
+        "step": 60,
+        "defaultValue": 900,
+        "description": "How often the iCalendar feeds are refreshed."
+      },
+      {
+        "key": "feedsFile",
+        "type": "path",
+        "label": "Calendar feeds file",
+        "defaultValue": "",
+        "description": "Optional. Defaults to ~/.config/omarchy/calendars/feeds.json."
+      }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clock"
+  }
+}
