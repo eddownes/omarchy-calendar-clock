@@ -92,29 +92,27 @@ Item {
   function addFeed(url, name) {
     var trimmed = String(url || "").replace(/^\s+|\s+$/g, "")
     if (trimmed === "" || feedProcess.running) return
-    feedProcess.environment = { "CALENDARS_FEED_URL": trimmed }
-    feedProcess.command = syncArgs(["--add-feed-env", "--name", String(name || "")])
-    feedProcess.running = true
+    runFeedOperation({ "action": "add", "url": trimmed, "name": String(name || "") })
   }
 
   function removeFeed(url) {
     if (feedProcess.running) return
-    feedProcess.environment = { "CALENDARS_FEED_URL": String(url) }
-    feedProcess.command = syncArgs(["--remove-feed-env"])
-    feedProcess.running = true
+    runFeedOperation({ "action": "remove", "url": String(url) })
   }
 
   function setFeedColor(url, color) {
     if (feedProcess.running) return
-    feedProcess.environment = { "CALENDARS_FEED_URL": String(url), "CALENDARS_FEED_COLOR": String(color) }
-    feedProcess.command = syncArgs(["--set-feed-color-env"])
-    feedProcess.running = true
+    runFeedOperation({ "action": "color", "url": String(url), "color": String(color) })
   }
 
   function moveFeed(url, index) {
     if (feedProcess.running) return
-    feedProcess.environment = { "CALENDARS_FEED_URL": String(url), "CALENDARS_FEED_INDEX": String(index) }
-    feedProcess.command = syncArgs(["--move-feed-env"])
+    runFeedOperation({ "action": "move", "url": String(url), "index": Number(index) })
+  }
+
+  function runFeedOperation(operation) {
+    feedProcess.input = JSON.stringify(operation) + "\n"
+    feedProcess.command = syncArgs(["--feed-operation-stdin"])
     feedProcess.running = true
   }
 
@@ -140,10 +138,15 @@ Item {
 
   Process {
     id: feedProcess
+    property string input: ""
     command: []
+    stdinEnabled: true
     stdout: StdioCollector { id: feedStdout; waitForEnd: true }
+    onStarted: write(input)
     onExited: function (exitCode) {
+      input = ""
       if (exitCode === 0) root.apply(String(feedStdout.text || ""))
+      else root.error = "calendar update failed (exit " + exitCode + ")"
     }
   }
 

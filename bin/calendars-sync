@@ -639,20 +639,8 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch shared iCalendar feeds and emit a flat event list as JSON.")
     parser.add_argument("--feeds", default="", help="feeds file (default ~/.config/omarchy/calendars/feeds.json)")
     parser.add_argument("--cached", action="store_true", help="print the last result without fetching")
-    parser.add_argument("--add-feed", metavar="URL", help="append a feed and sync")
-    parser.add_argument("--add-feed-env", action="store_true",
-                         help="like --add-feed, but read the URL from $CALENDARS_FEED_URL "
-                              "instead of argv (argv is world-readable via /proc)")
-    parser.add_argument("--name", default="", help="name for --add-feed")
-    parser.add_argument("--remove-feed", metavar="URL", help="drop a feed and sync")
-    parser.add_argument("--remove-feed-env", action="store_true",
-                         help="like --remove-feed, but read the URL from $CALENDARS_FEED_URL")
-    parser.add_argument("--set-feed-color-env", action="store_true",
-                         help="set the color of the feed named by $CALENDARS_FEED_URL "
-                              "to $CALENDARS_FEED_COLOR (#rrggbb), then sync")
-    parser.add_argument("--move-feed-env", action="store_true",
-                         help="move the feed named by $CALENDARS_FEED_URL to 0-based "
-                              "position $CALENDARS_FEED_INDEX, then sync")
+    parser.add_argument("--feed-operation-stdin", action="store_true",
+                        help="read one add/remove/color/move operation as JSON from stdin")
     parser.add_argument("--list-feeds", action="store_true", help="print the configured feeds")
     parser.add_argument("--back-months", type=int, default=1)
     parser.add_argument("--forward-months", type=int, default=12)
@@ -667,17 +655,26 @@ def main():
         print(json.dumps({"feedsFile": path, "error": error, "feeds": feeds}, ensure_ascii=False))
         return 0
 
-    add_url = os.environ.get("CALENDARS_FEED_URL", "") if args.add_feed_env else args.add_feed
-    remove_url = os.environ.get("CALENDARS_FEED_URL", "") if args.remove_feed_env else args.remove_feed
-    color_url = os.environ.get("CALENDARS_FEED_URL", "") if args.set_feed_color_env else ""
-    color_value = normalize_color(os.environ.get("CALENDARS_FEED_COLOR", "")) if color_url else ""
-    move_url = os.environ.get("CALENDARS_FEED_URL", "") if args.move_feed_env else ""
-    move_index = -1
-    if move_url:
+    operation = {}
+    if args.feed_operation_stdin:
         try:
-            move_index = int(os.environ.get("CALENDARS_FEED_INDEX", ""))
-        except ValueError:
-            move_index = -1
+            operation = json.loads(sys.stdin.readline())
+        except (json.JSONDecodeError, TypeError):
+            parser.error("stdin must contain one JSON feed operation")
+        if not isinstance(operation, dict):
+            parser.error("stdin feed operation must be a JSON object")
+
+    action = operation.get("action")
+    operation_url = str(operation.get("url", ""))
+    add_url = operation_url if action == "add" else ""
+    remove_url = operation_url if action == "remove" else ""
+    color_url = operation_url if action == "color" else ""
+    color_value = normalize_color(str(operation.get("color", ""))) if color_url else ""
+    move_url = operation_url if action == "move" else ""
+    try:
+        move_index = int(operation.get("index", -1))
+    except (TypeError, ValueError):
+        move_index = -1
 
     if add_url or remove_url or (color_url and color_value) or (move_url and move_index >= 0):
         feeds, error = load_feeds(path)
@@ -690,7 +687,7 @@ def main():
                 pass
             else:
                 feeds.append({
-                    "name": args.name.strip(),
+                    "name": str(operation.get("name", "")).strip(),
                     "url": url,
                     "color": PALETTE[len(feeds) % len(PALETTE)],
                     "enabled": True,
