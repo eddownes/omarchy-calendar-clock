@@ -292,22 +292,92 @@ def load_feeds(path):
         url = str(entry.get("url", "")).strip()
         if not url:
             continue
+        feed_type = str(entry.get("type", "")).strip() or "ics"
         feeds.append({
             "name": str(entry.get("name", "")).strip(),
             "url": url,
             "color": str(entry.get("color", "")).strip() or PALETTE[index % len(PALETTE)],
             "enabled": entry.get("enabled", True) is not False,
+            "type": feed_type,
+            "username": str(entry.get("username", "")).strip() if feed_type == "caldav" else "",
         })
     return feeds, ""
 
 
 def save_feeds(path, feeds):
     ensure_private_dir(os.path.dirname(path))
-    payload = [
-        {"name": f["name"], "url": f["url"], "color": f["color"], "enabled": f["enabled"]}
-        for f in feeds
-    ]
+    payload = []
+    for f in feeds:
+        entry = {"name": f["name"], "url": f["url"], "color": f["color"], "enabled": f["enabled"]}
+        # Kept out of the ICS-only entries most users still have, so an
+        # untouched feeds.json round-trips byte-for-byte.
+        if f.get("type") == "caldav":
+            entry["type"] = "caldav"
+            entry["username"] = f.get("username", "")
+        payload.append(entry)
     write_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def caldav_feed_id(url):
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def caldav_keyring_attrs(feed_id):
+    return ["service", "omarchy-calendar-clock", "kind", "caldav-password", "feed", feed_id]
+
+
+def store_caldav_password(feed_id, password):
+    subprocess.run(
+        ["secret-tool", "store", "--label=Omarchy Calendar Clock CalDAV password"]
+        + caldav_keyring_attrs(feed_id),
+        input=password.encode("utf-8"), capture_output=True, check=True,
+    )
+
+
+def lookup_caldav_password(feed_id):
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup"] + caldav_keyring_attrs(feed_id), capture_output=True,
+        )
+    except FileNotFoundError:
+        return None, "secret-tool not found -- install libsecret / gnome-keyring for CalDAV support"
+    if result.returncode != 0:
+        return None, "CalDAV password not found in the keyring"
+    # secret-tool lookup writes the secret with no trailing newline; rstrip
+    # only the newline curl's own config builder would otherwise carry
+    # through, not the password itself.
+    return result.stdout.decode("utf-8", "replace").rstrip("\n"), None
+
+
+def fetch_caldav(feed, window_start, window_end):
+    from _caldav import report_calendar_query_body, caldav_event_blobs, url_origin
+    from _netsafe import https_request
+
+    url = feed["url"]
+    path = cache_file(url)
+    if url_origin(url) == "":
+        return read_cache(path, "invalid CalDAV calendar address")
+
+    password, password_error = lookup_caldav_password(caldav_feed_id(url))
+    if password_error:
+        return read_cache(path, password_error)
+
+    status, body, _headers, error = https_request(
+        url, method="REPORT", headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        body=report_calendar_query_body(window_start, window_end),
+        auth=(feed.get("username", ""), password))
+    if error:
+        return read_cache(path, error)
+    if status not in (200, 207):
+        return read_cache(path, f"CalDAV server returned HTTP {status}")
+
+    blobs = caldav_event_blobs(body)
+    text = "\r\n".join(blobs) if blobs else "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
+    try:
+        write_atomic(path, text)
+    except OSError:
+        pass
+    return text, "", False
 
 
 def ensure_private_dir(directory):
@@ -578,7 +648,10 @@ def sync(path, back_months, forward_months):
             continue
 
         try:
-            text, error, from_cache = fetch(feed["url"])
+            if feed.get("type") == "caldav":
+                text, error, from_cache = fetch_caldav(feed, window_start, window_end)
+            else:
+                text, error, from_cache = fetch(feed["url"])
         except Exception as exc:
             # Belt and suspenders alongside the try/except inside fetch_one_hop:
             # one feed misbehaving -- however it manages to -- must not take
@@ -628,7 +701,10 @@ def sync(path, back_months, forward_months):
 
 
 def feed_summary(feed):
-    return {"name": plain_text(feed["name"]), "url": feed["url"], "color": feed["color"]}
+    return {
+        "name": plain_text(feed["name"]), "url": feed["url"], "color": feed["color"],
+        "type": feed.get("type") or "ics",
+    }
 
 
 def result_path():
@@ -709,7 +785,66 @@ def main():
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             return 0
 
-    if args.cached:
+    # Adds every calendar the caller picked from a calendars-discover result
+    # in one feeds.json write, then stores the one account password against
+    # each of them -- CalDAV discovery only ever runs against one set of
+    # credentials, so every calendar it found shares one login.
+    #
+    # A validation or keyring failure here is reported through the payload's
+    # top-level "error" rather than an early exit, so a bad password does not
+    # blank the calendar list the panel already has on screen -- it falls
+    # through to the ordinary sync() below like every other successful
+    # operation already does.
+    pending_error = ""
+    if action == "add-caldav":
+        calendars = operation.get("calendars")
+        username = str(operation.get("username", "")).strip()
+        password = str(operation.get("password", ""))
+        if not isinstance(calendars, list) or not calendars:
+            pending_error = "Choose at least one calendar"
+        elif not username:
+            pending_error = "Add the account username"
+        elif not password:
+            pending_error = "Add the account password"
+        else:
+            feeds, error = load_feeds(path)
+            if error:
+                pending_error = error
+            else:
+                added = []
+                for entry in calendars:
+                    if not isinstance(entry, dict):
+                        continue
+                    url = str(entry.get("url", "")).strip()
+                    if not url or not url.lower().startswith("https://"):
+                        continue
+                    if any(f["url"] == url for f in feeds):
+                        continue
+                    feeds.append({
+                        "name": str(entry.get("name", "")).strip() or "Calendar",
+                        "url": url,
+                        "color": normalize_color(str(entry.get("color", "")))
+                            or PALETTE[len(feeds) % len(PALETTE)],
+                        "enabled": True,
+                        "type": "caldav",
+                        "username": username,
+                    })
+                    added.append(url)
+                if not added:
+                    pending_error = "None of the discovered calendars could be added"
+                else:
+                    try:
+                        for url in added:
+                            store_caldav_password(caldav_feed_id(url), password)
+                    except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+                        pending_error = f"could not save the password: {exc}"
+                    else:
+                        try:
+                            save_feeds(path, feeds)
+                        except OSError as exc:
+                            pending_error = str(exc)
+
+    if args.cached and not pending_error:
         try:
             with open(result_path(), encoding="utf-8") as handle:
                 sys.stdout.write(handle.read())
@@ -734,6 +869,10 @@ def main():
             "ok": False, "configured": False, "feeds": [], "events": [],
             "error": plain_text(f"sync failed: {exc}"),
         }
+
+    if pending_error:
+        payload["ok"] = False
+        payload["error"] = plain_text(pending_error)
 
     text = json.dumps(payload, ensure_ascii=False)
     try:

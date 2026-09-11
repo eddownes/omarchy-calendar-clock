@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "matteodevenuto.clock",
-  "name": "Calendar Clock",
-  "version": "1.0.2",
-  "author": "Matteo De Venuto",
-  "description": "Date/time label with a calendar popup",
+  "id": "eddownes.calendar-clock",
+  "name": "Calendar Clock (CalDAV fork)",
+  "version": "1.1.0",
+  "author": "Ed Downes",
+  "description": "Date/time label with a calendar popup, iCalendar feeds, and CalDAV calendar discovery",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Calendar Clock",
-    "description": "Date/time label with a calendar popup and iCalendar feed events",
+    "description": "Date/time label with a calendar popup, iCalendar feeds, and CalDAV discovery",
     "category": "Time",
     "allowMultiple": false,
     "defaults": {
@@ -41,6 +41,6 @@
     ]
   },
   "omarchy": {
-    "clonedFrom": "omarchy.clock"
+    "clonedFrom": "matteodevenuto.clock"
   }
 }

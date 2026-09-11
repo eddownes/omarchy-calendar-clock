@@ -52,6 +52,13 @@ Panel {
   property bool showUpcoming: false
   property string feedDraft: ""
 
+  // CalDAV discovery form state. Ported from eddownes/OmaMailCalDav's
+  // components/CalendarSettings.qml: a server address, username and password
+  // go in, a checklist of the account's calendars comes back, and only the
+  // ones left checked get added.
+  property bool discoveryOpen: false
+  property var discoverySelected: ({})
+
   // Keep in sync with PALETTE in bin/calendars-sync.
   readonly property var calendarPalette: ["#8b7ff5", "#3fb98f", "#e8a33d", "#e0688a", "#4fa8de", "#c07ee8"]
 
@@ -200,6 +207,56 @@ Panel {
     feedUrl.text = ""
   }
 
+  function startDiscovery() {
+    root.discoveryOpen = true
+    root.discoverySelected = ({})
+    if (root.service) {
+      root.service.discoveryResults = []
+      root.service.discoveryError = ""
+    }
+  }
+
+  function cancelDiscovery() {
+    root.discoveryOpen = false
+    root.discoverySelected = ({})
+    discoveryUrl.text = ""
+    discoveryUsername.text = ""
+    discoveryPassword.text = ""
+    if (root.service) {
+      root.service.discoveryResults = []
+      root.service.discoveryError = ""
+    }
+  }
+
+  function runDiscovery() {
+    if (!root.service) return
+    root.discoverySelected = ({})
+    root.service.discoverCalendars(discoveryUrl.text, discoveryUsername.text, discoveryPassword.text)
+  }
+
+  function toggleDiscovered(url) {
+    var next = {}
+    for (var key in root.discoverySelected) next[key] = root.discoverySelected[key]
+    next[url] = root.discoverySelected[url] === false
+    root.discoverySelected = next
+  }
+
+  function selectedDiscoveredCalendars() {
+    var out = []
+    var results = root.service ? root.service.discoveryResults : []
+    for (var i = 0; i < results.length; i++) {
+      if (root.discoverySelected[results[i].url] !== false) out.push(results[i])
+    }
+    return out
+  }
+
+  function addDiscoveredCalendars() {
+    if (!root.service) return
+    root.service.addCaldavCalendars(
+      root.selectedDiscoveredCalendars(), discoveryUsername.text, discoveryPassword.text)
+    root.cancelDiscovery()
+  }
+
   function moveMonth(delta) {
     var next = Model.stepMonth(viewYear, viewMonth, delta)
     root.viewYear = next.year
@@ -317,6 +374,7 @@ Panel {
       anchors.fill: parent
       // While a settings input holds focus, text keys belong to it.
       blocked: root.editingLife || feedUrl.activeFocus
+        || discoveryUrl.activeFocus || discoveryUsername.activeFocus || discoveryPassword.activeFocus
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) root.moveMonth(dx)
         if (dy !== 0) root.moveYear(dy)
@@ -961,7 +1019,8 @@ Panel {
                   anchors.leftMargin: Style.space(24)
                   anchors.right: orderButtons.left
                   anchors.verticalCenter: parent.verticalCenter
-                  text: (feedRow.modelData.name || "Calendar") + " · "
+                  text: (feedRow.modelData.name || "Calendar")
+                    + (feedRow.modelData.type === "caldav" ? " (CalDAV)" : "") + " · "
                     + (feedRow.modelData.count || 0) + " events"
                   elide: Text.ElideRight
                   color: root.contentForeground
@@ -1101,6 +1160,175 @@ Panel {
               color: Qt.darker(root.contentForeground, 1.9)
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.spacing.hairline
+              color: root.contentForeground
+              opacity: 0.1
+            }
+
+            // CalDAV discovery, ported from eddownes/OmaMailCalDav's
+            // "Discover calendars..." flow: a server address, username and
+            // password go in, a checklist of the account's calendars comes
+            // back out, checked ones get added on the same shared password.
+            Row {
+              visible: !root.discoveryOpen
+              width: parent.width
+
+              Button {
+                text: "Discover calendars…"
+                bordered: true
+                enabled: !(root.service && root.service.syncing)
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: root.startDiscovery()
+              }
+            }
+
+            Column {
+              visible: root.discoveryOpen
+              width: parent.width
+              spacing: Style.space(6)
+
+              Column {
+                visible: !root.service || root.service.discoveryResults.length === 0
+                width: parent.width
+                spacing: Style.space(6)
+
+                TextField {
+                  id: discoveryUrl
+                  width: parent.width
+                  placeholderText: "CalDAV server address (https://…)"
+                  enabled: !(root.service && root.service.discovering)
+                  foreground: root.contentForeground
+                  font.family: root.contentFontFamily
+                }
+
+                TextField {
+                  id: discoveryUsername
+                  width: parent.width
+                  placeholderText: "Username"
+                  enabled: !(root.service && root.service.discovering)
+                  foreground: root.contentForeground
+                  font.family: root.contentFontFamily
+                }
+
+                TextField {
+                  id: discoveryPassword
+                  width: parent.width
+                  password: true
+                  placeholderText: "Password"
+                  enabled: !(root.service && root.service.discovering)
+                  foreground: root.contentForeground
+                  font.family: root.contentFontFamily
+                  Keys.onReturnPressed: root.runDiscovery()
+                  Keys.onEnterPressed: root.runDiscovery()
+                }
+
+                Text {
+                  visible: root.service && root.service.discoveryError !== ""
+                  width: parent.width
+                  text: root.service ? root.service.discoveryError : ""
+                  wrapMode: Text.WordWrap
+                  color: Color.urgent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Row {
+                  spacing: Style.space(6)
+
+                  Button {
+                    text: root.service && root.service.discovering ? "Searching…" : "Find calendars"
+                    bordered: true
+                    enabled: !(root.service && root.service.discovering)
+                      && discoveryUrl.text.indexOf("https://") === 0
+                      && discoveryUsername.text.length > 0 && discoveryPassword.text.length > 0
+                    opacity: enabled ? 1 : 0.45
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.runDiscovery()
+                  }
+
+                  Button {
+                    text: "Cancel"
+                    bordered: false
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.cancelDiscovery()
+                  }
+                }
+              }
+
+              Column {
+                visible: root.service && root.service.discoveryResults.length > 0
+                width: parent.width
+                spacing: Style.space(4)
+
+                Text {
+                  width: parent.width
+                  text: "Found " + (root.service ? root.service.discoveryResults.length : 0) + " calendar"
+                    + ((root.service && root.service.discoveryResults.length === 1) ? "" : "s") + ". Choose which to add:"
+                  wrapMode: Text.WordWrap
+                  color: root.contentForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Repeater {
+                  model: root.service ? root.service.discoveryResults : []
+
+                  Row {
+                    id: discoveredRow
+                    required property var modelData
+                    width: parent.width
+                    height: Style.space(24)
+
+                    Text {
+                      width: parent.width - discoveredSwitch.width - Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: discoveredRow.modelData.name || "Calendar"
+                      elide: Text.ElideRight
+                      color: root.contentForeground
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+
+                    ToggleSwitch {
+                      id: discoveredSwitch
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: root.discoverySelected[discoveredRow.modelData.url] !== false
+                      onToggled: root.toggleDiscovered(discoveredRow.modelData.url)
+                    }
+                  }
+                }
+
+                Row {
+                  spacing: Style.space(6)
+
+                  Button {
+                    text: "Add " + root.selectedDiscoveredCalendars().length + " calendar"
+                      + (root.selectedDiscoveredCalendars().length === 1 ? "" : "s")
+                    bordered: true
+                    enabled: !(root.service && root.service.syncing)
+                      && root.selectedDiscoveredCalendars().length > 0
+                    opacity: enabled ? 1 : 0.45
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.addDiscoveredCalendars()
+                  }
+
+                  Button {
+                    text: "Cancel"
+                    bordered: false
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.cancelDiscovery()
+                  }
+                }
+              }
             }
           }
 
